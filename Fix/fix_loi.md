@@ -55,3 +55,21 @@
 **Cách sửa:** Gom tất cả event theo `question_id`, sắp xếp/đánh giá theo `attempt_no`; xác định kết quả cuối của câu và chất lượng SRS theo quy tắc thử lại (đúng sau lần đầu: `q = 3`). Tính accuracy theo lần thử đầu và chỉ cập nhật SRS một lần mỗi từ với `q` thấp nhất trong phiên.
 
 
+
+## Lần sửa [3]
+
+### Lỗi 11 — Hết giờ không được ghi thành câu trả lời sai
+**Mô tả lỗi:** `handleTimeOut` chỉ trừ Heart ở giao diện và mở ExplainSheet; không tạo `AnswerEvent`, không gửi event tới `/sessions/:id/events` và cũng không thêm câu vào `answerEvents`. Theo đặc tả, hết giờ phải được tính là sai (`q = 1`). Hiện server không cập nhật lapse/SRS và Sổ tay cho từ này; nếu hoàn tất phiên, event của câu hết giờ cũng không có trong lịch sử.
+
+**Cách sửa:** Khi hết giờ, tạo event cho `currentQ.id` với đáp án đánh dấu hết giờ, `attempt_no` phù hợp, `response_ms` hợp lệ và `hint_used = false`; lưu vào state/hàng đợi và đồng bộ lên server. Máy chủ cần nhận diện timeout như câu sai để cập nhật Heart, error_category và SRS với `q = 1`.
+
+### Lỗi 12 — Chưa có hàng đợi event offline và autosave bằng IndexedDB
+**Mô tả lỗi:** Đặc tả yêu cầu lưu trạng thái phiên và AnswerEvent vào IndexedDB, gửi lại idempotent khi có mạng. Trong mã hiện tại không có sử dụng IndexedDB; các lệnh gửi event dùng `fetch(...).catch(() => {})`, bỏ qua lỗi mạng và không có hàng đợi thử gửi lại. Nếu mất kết nối hoặc tải lại trang trước khi server lưu event, câu trả lời và tiến độ phiên có thể mất.
+
+**Cách sửa:** Lưu event và trạng thái phiên vào IndexedDB trước khi gửi; đồng bộ theo lô khi có mạng, xóa event khỏi hàng đợi sau khi server xác nhận và giữ nguyên `client_event_id` khi thử gửi lại để server loại trùng. Khi khôi phục phiên, tải trạng thái từ IndexedDB.
+
+### Kết quả kiểm tra tự động — 29/10/2026
+- `scripts/verify-api.mjs`: **7/7 đạt** (các luồng tương ứng Lỗi 1–7).
+- `scripts/verify-lan2.mjs`: **3/3 đạt** (các luồng tương ứng Lỗi 8–10).
+- `scripts/verify-lan3.mjs`: **1/1 đạt** (luồng timeout Lỗi 11).
+- Lỗi 12 (IndexedDB offline event queue & autosave): đã được triển khai hoàn chỉnh trong `src/lib/offlineQueue.ts` và tích hợp vào `play/[sessionId]/page.tsx`, kiểm chứng qua build biên dịch không lỗi.

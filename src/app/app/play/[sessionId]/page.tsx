@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { useParams, useRouter } from 'next/navigation';
 import Link from 'next/link';
 import { GameHUD } from '@/components/common/GameHUD';
@@ -9,6 +9,18 @@ import { ExplainSheet } from '@/components/common/ExplainSheet';
 import { sound } from '@/lib/audio';
 import { GameSession, AnswerEvent } from '@/types';
 import { AlertCircle, ArrowLeft, RotateCcw } from 'lucide-react';
+// Lỗi 12 Fix: Import offline queue functions for IndexedDB persistence & sync
+import {
+  enqueueEvent,
+  syncEventsToServer,
+  flushPendingEvents,
+  saveSessionState,
+  loadSessionState,
+  clearSessionState,
+  clearSessionEvents,
+  startOnlineListener,
+  getPendingEvents,
+} from '@/lib/offlineQueue';
 
 export default function PlayGamePage() {
   const params = useParams();
@@ -30,6 +42,24 @@ export default function PlayGamePage() {
   const [questionStartTime, setQuestionStartTime] = useState<number>(Date.now());
   const sessionStartTimeRef = useRef<number>(Date.now());
 
+  // Lỗi 11 Fix: Refs to avoid stale closures in setInterval/timeout callbacks
+  const answerEventsRef = useRef<AnswerEvent[]>([]);
+  const currentQIndexRef = useRef<number>(0);
+  const sessionRef = useRef<GameSession | null>(null);
+  const heartsRef = useRef<number>(5);
+  const comboRef = useRef<number>(0);
+  const scoreRef = useRef<number>(0);
+  const questionStartTimeRef = useRef<number>(Date.now());
+
+  // Keep refs in sync with state
+  useEffect(() => { answerEventsRef.current = answerEvents; }, [answerEvents]);
+  useEffect(() => { currentQIndexRef.current = currentQIndex; }, [currentQIndex]);
+  useEffect(() => { sessionRef.current = session; }, [session]);
+  useEffect(() => { heartsRef.current = hearts; }, [hearts]);
+  useEffect(() => { comboRef.current = combo; }, [combo]);
+  useEffect(() => { scoreRef.current = score; }, [score]);
+  useEffect(() => { questionStartTimeRef.current = questionStartTime; }, [questionStartTime]);
+
   // ExplainSheet State
   const [explainData, setExplainData] = useState<any>(null);
   const [showExplain, setShowExplain] = useState(false);
@@ -37,7 +67,45 @@ export default function PlayGamePage() {
   // Timer Ref
   const timerRef = useRef<NodeJS.Timeout | null>(null);
 
+  // Lỗi 12 Fix: Helper — enqueue event to IndexedDB then sync to server
+  const persistAndSyncEvent = useCallback(async (event: AnswerEvent, sid: string) => {
+    const pendingEvent = {
+      ...event,
+      session_id: sid,
+      created_at: Date.now(),
+    };
+    // 1. Persist to IndexedDB first (survives page reload / offline)
+    await enqueueEvent(pendingEvent);
+    // 2. Attempt to sync to server; on failure events stay in IndexedDB for retry
+    await syncEventsToServer(sid, [pendingEvent]);
+  }, []);
+
+  // Lỗi 12 Fix: Helper — autosave session state to IndexedDB
+  const autosaveState = useCallback(async (
+    sid: string,
+    qIndex: number,
+    h: number,
+    s: number,
+    c: number,
+    events: AnswerEvent[],
+  ) => {
+    await saveSessionState({
+      session_id: sid,
+      current_q_index: qIndex,
+      hearts: h,
+      score: s,
+      combo: c,
+      answer_events: events.map(e => ({
+        ...e,
+        session_id: sid,
+        created_at: Date.now(),
+      })),
+      updated_at: Date.now(),
+    });
+  }, []);
+
   // Lỗi 7 Fix: Tải session theo ID thật từ server, không tự tạo mock/fallback session
+  // Lỗi 12 Fix: Also restore IndexedDB snapshot and pending events on load
   useEffect(() => {
     let isMounted = true;
     setLoading(true);
@@ -60,8 +128,65 @@ export default function PlayGamePage() {
           return;
         }
 
+        // Lỗi 12 Fix: Check for saved IndexedDB snapshot to restore progress
+        let restoredQIndex = 0;
+        let restoredHearts = data.config?.hearts ?? (data.play_mode === 'learning' ? 999 : 5);
+        let restoredScore = 0;
+        let restoredCombo = 0;
+        let restoredEvents: AnswerEvent[] = data.logged_events || [];
+
+        try {
+          const snapshot = await loadSessionState(sessionId);
+          if (snapshot && snapshot.updated_at > 0) {
+            // Restore from IndexedDB snapshot if it has progress
+            restoredQIndex = snapshot.current_q_index;
+            restoredHearts = snapshot.hearts;
+            restoredScore = snapshot.score;
+            restoredCombo = snapshot.combo;
+            // Merge IndexedDB events with server logged_events
+            const serverEventIds = new Set(restoredEvents.map(e => e.client_event_id));
+            const snapshotOnlyEvents = (snapshot.answer_events || [])
+              .filter(e => !serverEventIds.has(e.client_event_id))
+              .map(e => ({
+                client_event_id: e.client_event_id,
+                question_id: e.question_id,
+                user_answer: e.user_answer,
+                attempt_no: e.attempt_no,
+                response_ms: e.response_ms,
+                hint_used: e.hint_used,
+              }));
+            restoredEvents = [...restoredEvents, ...snapshotOnlyEvents];
+          }
+
+          // Also check for pending events not yet synced
+          const pending = await getPendingEvents(sessionId);
+          if (pending.length > 0) {
+            const existingIds = new Set(restoredEvents.map(e => e.client_event_id));
+            const newPending = pending
+              .filter(p => !existingIds.has(p.client_event_id))
+              .map(p => ({
+                client_event_id: p.client_event_id,
+                question_id: p.question_id,
+                user_answer: p.user_answer,
+                attempt_no: p.attempt_no,
+                response_ms: p.response_ms,
+                hint_used: p.hint_used,
+              }));
+            restoredEvents = [...restoredEvents, ...newPending];
+            // Try to flush pending events now
+            flushPendingEvents(sessionId).catch(() => {});
+          }
+        } catch {
+          // IndexedDB unavailable; proceed with server data only
+        }
+
         setSession(data);
-        setHearts(data.config?.hearts ?? (data.play_mode === 'learning' ? 999 : 5));
+        setCurrentQIndex(restoredQIndex);
+        setHearts(restoredHearts);
+        setScore(restoredScore);
+        setCombo(restoredCombo);
+        setAnswerEvents(restoredEvents);
+
         const initialTimer = data.config?.time_limit_ms > 0
           ? Math.round(data.config.time_limit_ms / 1000)
           : (data.game_code === 'sentence_builder' ? 40 : 25);
@@ -69,9 +194,10 @@ export default function PlayGamePage() {
         setQuestionStartTime(Date.now());
         sessionStartTimeRef.current = Date.now();
 
-        if (data.logged_events && data.logged_events.length > 0) {
-          setAnswerEvents(data.logged_events);
-        }
+        // Lỗi 12 Fix: Start online listener to auto-flush when connectivity returns
+        const cleanupListener = startOnlineListener(sessionId);
+        // Store cleanup so the unmount effect can call it
+        onlineListenerCleanupRef.current = cleanupListener;
       } catch (err: any) {
         if (!isMounted) return;
         setErrorMessage(err.message || 'Lỗi kết nối khi tải phiên chơi');
@@ -87,8 +213,56 @@ export default function PlayGamePage() {
     return () => {
       isMounted = false;
       if (timerRef.current) clearInterval(timerRef.current);
+      // Lỗi 12 Fix: Cleanup online listener
+      if (onlineListenerCleanupRef.current) {
+        onlineListenerCleanupRef.current();
+      }
     };
   }, [sessionId, router]);
+
+  // Lỗi 12 Fix: Ref for online listener cleanup
+  const onlineListenerCleanupRef = useRef<(() => void) | null>(null);
+
+  // Lỗi 12 Fix: Save state to IndexedDB on page unload / visibility change
+  useEffect(() => {
+    const handleBeforeUnload = () => {
+      const sess = sessionRef.current;
+      if (sess) {
+        // Best-effort save — cannot await in beforeunload
+        saveSessionState({
+          session_id: sessionId,
+          current_q_index: currentQIndexRef.current,
+          hearts: heartsRef.current,
+          score: scoreRef.current,
+          combo: comboRef.current,
+          answer_events: answerEventsRef.current.map(e => ({
+            ...e,
+            session_id: sessionId,
+            created_at: Date.now(),
+          })),
+          updated_at: Date.now(),
+        }).catch(() => {});
+      }
+    };
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'hidden') {
+        handleBeforeUnload();
+      }
+    };
+
+    if (typeof window !== 'undefined') {
+      window.addEventListener('beforeunload', handleBeforeUnload);
+      document.addEventListener('visibilitychange', handleVisibilityChange);
+    }
+
+    return () => {
+      if (typeof window !== 'undefined') {
+        window.removeEventListener('beforeunload', handleBeforeUnload);
+        document.removeEventListener('visibilitychange', handleVisibilityChange);
+      }
+    };
+  }, [sessionId]);
 
   // Countdown Timer
   useEffect(() => {
@@ -118,15 +292,62 @@ export default function PlayGamePage() {
     };
   }, [session, isPaused, showExplain, currentQIndex]);
 
+  // Lỗi 11 Fix: handleTimeOut now creates an AnswerEvent and syncs to server
   const handleTimeOut = () => {
     sound.playWrong();
-    if (session?.play_mode === 'adventure') {
+
+    // Read from refs to avoid stale closure inside setInterval
+    const sess = sessionRef.current;
+    const qIdx = currentQIndexRef.current;
+    const currentQ = sess?.questions[qIdx];
+
+    if (sess?.play_mode === 'adventure') {
       setHearts((h) => Math.max(0, h - 1));
     }
     setCombo(0);
 
-    const currentQ = session?.questions[currentQIndex];
     if (currentQ) {
+      // Lỗi 11 Fix: Determine attempt_no from existing events for this question
+      const existingEventsForQ = answerEventsRef.current.filter(
+        (e) => e.question_id === currentQ.id
+      );
+      const attemptNo = existingEventsForQ.length + 1;
+
+      // Lỗi 11 Fix: Create AnswerEvent for timeout — user_answer = '__timeout__'
+      // Server treats any non-matching answer as wrong → q=1, lapse, notebook
+      const timeLimitMs = sess?.config?.time_limit_ms > 0
+        ? sess.config.time_limit_ms
+        : (sess?.game_code === 'sentence_builder' ? 40000 : 25000);
+      const responseMs = Math.max(260, timeLimitMs);
+
+      const event: AnswerEvent = {
+        client_event_id: `ev_${sess?.id || sessionId}_${currentQ.id}_timeout_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+        question_id: currentQ.id,
+        user_answer: '__timeout__',
+        attempt_no: attemptNo,
+        response_ms: responseMs,
+        hint_used: false,
+      };
+
+      // Add to state
+      const nextEvents = [...answerEventsRef.current, event];
+      setAnswerEvents(nextEvents);
+
+      // Lỗi 12 Fix: Persist to IndexedDB then sync to server
+      const sid = sess?.id || sessionId;
+      persistAndSyncEvent(event, sid).catch(() => {});
+
+      // Lỗi 12 Fix: Autosave session state after timeout
+      autosaveState(
+        sid,
+        qIdx,
+        Math.max(0, heartsRef.current - (sess?.play_mode === 'adventure' ? 1 : 0)),
+        scoreRef.current,
+        0, // combo reset to 0
+        nextEvents,
+      ).catch(() => {});
+
+      // Show explanation sheet
       setExplainData({
         isCorrect: false,
         correctAnswer: currentQ.payload.correct_answer,
@@ -135,6 +356,15 @@ export default function PlayGamePage() {
         meaning: currentQ.payload.explanation_refs?.meaning,
       });
       setShowExplain(true);
+
+      // Lỗi 11 Fix: Check if hearts ran out after timeout (Adventure mode)
+      if (sess?.play_mode === 'adventure') {
+        const nextHearts = heartsRef.current - 1;
+        if (nextHearts <= 0) {
+          // Hearts depleted — will finish session when ExplainSheet is dismissed
+          // The finishSession will be triggered in handleExplainContinue
+        }
+      }
     }
   };
 
@@ -162,18 +392,21 @@ export default function PlayGamePage() {
     const nextEvents = [...answerEvents, event];
     setAnswerEvents(nextEvents);
 
-    // Lỗi 6: Đồng bộ batch event lên server để lưu vào logged_events
-    fetch(`/api/v1/sessions/${session?.id || sessionId}/events`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ events: [event] }),
-    }).catch(() => {});
+    // Lỗi 12 Fix: Persist to IndexedDB then sync to server (replaces bare fetch)
+    const sid = session?.id || sessionId;
+    persistAndSyncEvent(event, sid).catch(() => {});
+
+    // Lỗi 12 Fix: Autosave session state after each answer
+    const nextCombo = isCorrect ? combo + 1 : 0;
+    const mult = isCorrect ? Math.min(3.0, 1 + 0.5 * Math.floor(nextCombo / 3)) : 1;
+    const base = session?.config?.base_score || 100;
+    const nextScore = isCorrect ? score + Math.round(base * mult) : score;
+    const nextHearts = (!isCorrect && session?.play_mode === 'adventure') ? hearts - 1 : hearts;
+    autosaveState(sid, currentQIndex, nextHearts, nextScore, nextCombo, nextEvents).catch(() => {});
 
     if (isCorrect) {
       const newCombo = combo + 1;
       setCombo(newCombo);
-      const mult = Math.min(3.0, 1 + 0.5 * Math.floor(newCombo / 3));
-      const base = session?.config?.base_score || 100;
       setScore((s) => s + Math.round(base * mult));
 
       // Chuyển sang câu tiếp theo
@@ -181,7 +414,6 @@ export default function PlayGamePage() {
     } else {
       setCombo(0);
       if (session?.play_mode === 'adventure') {
-        const nextHearts = hearts - 1;
         setHearts(nextHearts);
         if (nextHearts <= 0) {
           // Hết tim trong chế độ Adventure -> thua phiên
@@ -218,12 +450,18 @@ export default function PlayGamePage() {
 
     setAnswerEvents(formattedEvents);
 
-    // Sync events lên server
-    fetch(`/api/v1/sessions/${session?.id || sessionId}/events`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ events: formattedEvents }),
-    }).catch(() => {});
+    // Lỗi 12 Fix: Persist flip card events to IndexedDB then sync
+    const sid = session?.id || sessionId;
+    (async () => {
+      for (const evt of formattedEvents) {
+        await enqueueEvent({ ...evt, session_id: sid, created_at: Date.now() });
+      }
+      await syncEventsToServer(sid, formattedEvents.map(e => ({
+        ...e,
+        session_id: sid,
+        created_at: Date.now(),
+      })));
+    })().catch(() => {});
 
     // Flip card win condition
     const isWin = session?.play_mode === 'learning' ? true : accuracy >= 60;
@@ -235,6 +473,14 @@ export default function PlayGamePage() {
       if (isWin) sound.playWin();
       else sound.playWrong();
 
+      // Lỗi 12 Fix: Flush all pending IndexedDB events before completing
+      const sid = session?.id || sessionId;
+      try {
+        await flushPendingEvents(sid);
+      } catch {
+        // best-effort flush
+      }
+
       const totalDuration = Math.max(1000, Date.now() - sessionStartTimeRef.current);
       await fetch(`/api/v1/sessions/${session?.id || sessionId}/complete`, {
         method: 'POST',
@@ -244,6 +490,15 @@ export default function PlayGamePage() {
           events: eventsList,
         }),
       });
+
+      // Lỗi 12 Fix: Clear IndexedDB data after successful completion
+      try {
+        await clearSessionEvents(sid);
+        await clearSessionState(sid);
+      } catch {
+        // best-effort cleanup
+      }
+
       router.push(`/app/result/${session?.id || sessionId}`);
     } catch (err) {
       router.push(`/app/result/${session?.id || sessionId}`);
@@ -257,6 +512,12 @@ export default function PlayGamePage() {
 
   const handleExplainContinue = () => {
     setShowExplain(false);
+    // Lỗi 11 Fix: Check if hearts are depleted after timeout (Adventure)
+    // Use ref to get latest hearts value
+    if (sessionRef.current?.play_mode === 'adventure' && heartsRef.current <= 0) {
+      finishSession(false, answerEventsRef.current);
+      return;
+    }
     advanceQuestion();
   };
 
