@@ -623,11 +623,52 @@ class StoreManager {
       return session.completed_result;
     }
 
-    // Merge incoming events with session.logged_events (deduplicated by client_event_id)
+    // Lỗi 9: Chỉ giữ các event thuộc về session.questions, loại bỏ event lạ
+    const validQuestionIds = new Set(session.questions.map((q) => q.id));
+
+    // Khử trùng lặp theo client_event_id (hoặc cặp question_id + attempt_no)
     const allEventsMap = new Map<string, any>();
-    (session.logged_events || []).forEach((e) => allEventsMap.set(e.client_event_id || e.question_id, e));
-    (payload.events || []).forEach((e) => allEventsMap.set(e.client_event_id || e.question_id, e));
+    const registerEvent = (e: any) => {
+      if (!e || !e.question_id || !validQuestionIds.has(e.question_id)) {
+        return; // Bỏ qua/từ chối event ngoài danh sách câu
+      }
+      const eventKey = e.client_event_id || `${e.question_id}_att_${e.attempt_no || 1}`;
+      if (!allEventsMap.has(eventKey)) {
+        allEventsMap.set(eventKey, {
+          client_event_id: e.client_event_id || eventKey,
+          question_id: e.question_id,
+          user_answer: String(e.user_answer ?? ''),
+          attempt_no: Number(e.attempt_no || 1),
+          response_ms: Number(e.response_ms || 0),
+          hint_used: Boolean(e.hint_used),
+        });
+      }
+    };
+
+    (session.logged_events || []).forEach(registerEvent);
+    (payload.events || []).forEach(registerEvent);
     const mergedEvents = Array.from(allEventsMap.values());
+
+    // Lỗi 10: Gom tất cả event theo question_id
+    const eventsByQuestion = new Map<string, any[]>();
+    mergedEvents.forEach((ev) => {
+      const list = eventsByQuestion.get(ev.question_id) || [];
+      list.push(ev);
+      eventsByQuestion.set(ev.question_id, list);
+    });
+
+    const isAnswerCorrect = (userAns: string, q: SessionQuestion): boolean => {
+      if (!userAns) return false;
+      const clean = userAns.trim().toLowerCase();
+      const target = (q.payload.correct_answer || '').trim().toLowerCase();
+      if (clean === target) return true;
+      if (q.payload.accepted_answers && Array.isArray(q.payload.accepted_answers)) {
+        return q.payload.accepted_answers.some(
+          (a: string) => a.trim().toLowerCase() === clean
+        );
+      }
+      return false;
+    };
 
     const user = data.user;
     let totalScore = 0;
@@ -639,25 +680,50 @@ class StoreManager {
     const vocabResults: Map<string, { q: number; isCorrect: boolean; skill: SkillCode }> = new Map();
 
     session.questions.forEach((q) => {
-      const ev = mergedEvents.find((e) => e.question_id === q.id);
+      const qEventsRaw = eventsByQuestion.get(q.id);
       const vocab = data.vocabularies.find((v) => v.id === q.vocab_id);
-      if (!ev) return;
+      if (!qEventsRaw || qEventsRaw.length === 0) {
+        return;
+      }
 
-      const isCorrect: boolean = Boolean(
-        ev.user_answer.trim().toLowerCase() === q.payload.correct_answer.trim().toLowerCase() ||
-        (q.payload.accepted_answers && q.payload.accepted_answers.some((a: string) => a.trim().toLowerCase() === ev.user_answer.trim().toLowerCase()))
+      // Lỗi 10: Khử trùng lặp theo attempt_no và sắp xếp theo thứ tự lần thử
+      const attemptMap = new Map<number, any>();
+      qEventsRaw.forEach((ev) => {
+        const att = ev.attempt_no || 1;
+        if (!attemptMap.has(att)) {
+          attemptMap.set(att, ev);
+        }
+      });
+      const sortedAttempts = Array.from(attemptMap.values()).sort(
+        (a, b) => (a.attempt_no || 1) - (b.attempt_no || 1)
       );
+
+      // Đánh giá lần thử đầu tiên (attempt_no === 1) cho accuracy
+      const firstAttempt = sortedAttempts.find((a) => (a.attempt_no || 1) === 1) || sortedAttempts[0];
+      const isFirstTryCorrect = Boolean(firstAttempt && isAnswerCorrect(firstAttempt.user_answer, q));
+
+      if (isFirstTryCorrect && !firstAttempt.hint_used) {
+        firstTryCorrectCount++;
+      }
+
+      // Đánh giá tất cả lần thử để tìm kết quả cuối cùng & chất lượng q của câu này:
+      // - Đúng ngay lần đầu (attempt_no === 1, không hint): q = (sentence_use/spelling ? 5 : 4)
+      // - Đúng sau lần đầu (attempt_no >= 2) hoặc có dùng hint: q = 3
+      // - Sai toàn bộ: q = 1
+      const correctAttempt = sortedAttempts.find((a) => isAnswerCorrect(a.user_answer, q));
+      const isQuestionSolved = Boolean(correctAttempt);
 
       let qRating = 1;
       let errorCategory: ErrorCategory = 'meaning';
 
-      if (isCorrect) {
-        if (ev.attempt_no === 1 && !ev.hint_used) {
+      if (isQuestionSolved) {
+        if (isFirstTryCorrect && !firstAttempt.hint_used) {
           qRating = (q.skill_code === 'sentence_use' || q.skill_code === 'spelling') ? 5 : 4;
-          firstTryCorrectCount++;
         } else {
+          // Lỗi 10: Đúng sau lần thử đầu hoặc có dùng hint nhận q = 3
           qRating = 3;
         }
+
         combo++;
         if (combo > maxCombo) maxCombo = combo;
 
@@ -665,11 +731,10 @@ class StoreManager {
         const mult = Math.min(3.0, 1 + 0.5 * Math.floor(combo / 3));
         const multTotal = Math.min(4.0, mult);
         const base = session.config.base_score || 100;
-        const speedBonus = ev.response_ms > 0 ? Math.max(0, 1.2 - ev.response_ms / 15000) : 1;
+        const speedBonus = correctAttempt.response_ms > 0 ? Math.max(0, 1.2 - correctAttempt.response_ms / 15000) : 1;
         totalScore += Math.round(base * speedBonus * multTotal);
       } else {
         combo = 0;
-        if (session.play_mode === 'adventure') hearts--;
         if (q.skill_code === 'pos_form') errorCategory = 'pos';
         else if (q.skill_code === 'spelling') errorCategory = 'spelling';
         else if (q.skill_code === 'sentence_use') errorCategory = 'word_order';
@@ -679,22 +744,28 @@ class StoreManager {
         wrongWordsMap.set(q.vocab_id, errorCategory);
       }
 
+      // Trừ tim trong Adventure: mỗi lần thử sai trừ 1 tim
+      if (session.play_mode === 'adventure') {
+        const wrongAttemptsCount = sortedAttempts.filter((a) => !isAnswerCorrect(a.user_answer, q)).length;
+        hearts -= wrongAttemptsCount;
+      }
+
       if (session.play_mode === 'learning') {
         qRating = Math.min(4, qRating);
       }
 
-      // Lỗi 5: SRS lấy chất lượng q THẤP NHẤT trong phiên thay vì ghi đè bằng kết quả cuối
+      // Lỗi 5 & 10: Cập nhật SRS một lần mỗi từ với q thấp nhất trong phiên
       const existing = vocabResults.get(q.vocab_id);
       if (!existing) {
         vocabResults.set(q.vocab_id, {
           q: qRating,
-          isCorrect,
+          isCorrect: isQuestionSolved,
           skill: q.skill_code,
         });
       } else {
         vocabResults.set(q.vocab_id, {
           q: Math.min(existing.q, qRating),
-          isCorrect: existing.isCorrect && isCorrect,
+          isCorrect: existing.isCorrect && isQuestionSolved,
           skill: q.skill_code,
         });
       }
@@ -709,8 +780,8 @@ class StoreManager {
         attempts: 0,
         correct: 0,
       };
-      stat.attempts++;
-      if (isCorrect) {
+      stat.attempts += sortedAttempts.length;
+      if (isQuestionSolved) {
         stat.correct++;
         stat.last_correct_at = new Date().toISOString();
       }
@@ -727,17 +798,30 @@ class StoreManager {
           errors: 0,
           ewma_error: 0.2,
         };
-        posStat.attempts++;
-        if (!isCorrect) posStat.errors++;
-        posStat.ewma_error = 0.8 * posStat.ewma_error + 0.2 * (isCorrect ? 0 : 1);
+        posStat.attempts += sortedAttempts.length;
+        if (!isQuestionSolved) posStat.errors++;
+        posStat.ewma_error = 0.8 * posStat.ewma_error + 0.2 * (isQuestionSolved ? 0 : 1);
         data.posStats[user.id][vocab.pos_id] = posStat;
       }
     });
 
+    // Lỗi 9: Khử trùng lặp theo câu, đếm số question_id DUY NHẤT có kết quả
+    const answeredQuestionIds = new Set(
+      session.questions
+        .filter((q) => {
+          const list = eventsByQuestion.get(q.id);
+          return list && list.length > 0;
+        })
+        .map((q) => q.id)
+    );
+    const hasAnsweredAllQuestions =
+      session.questions.length > 0 &&
+      session.questions.every((q) => answeredQuestionIds.has(q.id));
+
     const totalQuestions = session.questions.length || 1;
     const accuracy = Math.round((firstTryCorrectCount / totalQuestions) * 100);
 
-    // Lỗi 3: Ngưỡng qua màn riêng cho từng game theo bảng cấu hình 8.8
+    // Lỗi 3 & 9: Ngưỡng qua màn riêng cho từng game theo bảng cấu hình 8.8
     const accuracyThresholds: Record<GameCode, number> = {
       flip_card: 60,
       fill_blank: 70,
@@ -750,10 +834,10 @@ class StoreManager {
     };
     const requiredAccuracy = accuracyThresholds[session.game_code] ?? 70;
 
-    // Chế độ Learning: hoàn thành mọi câu là qua, không xét Heart hay accuracy
+    // Lỗi 9: Chế độ Learning: CHỈ HOÀN TẤT KHI ĐÃ CÓ KẾT QUẢ CHO ĐỦ TỪNG question_id trong session
     const isWin = session.play_mode === 'learning'
-      ? mergedEvents.length >= session.questions.length || totalQuestions <= 1
-      : hearts > 0 && accuracy >= requiredAccuracy;
+      ? hasAnsweredAllQuestions
+      : hearts > 0 && accuracy >= requiredAccuracy && hasAnsweredAllQuestions;
 
     // Stars (chỉ cấp trong Adventure khi thắng)
     let stars = 0;

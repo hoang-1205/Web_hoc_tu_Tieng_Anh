@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { sound } from '@/lib/audio';
 import { PosChip } from '../common/PosChip';
 import { POSCode } from '@/types';
@@ -9,6 +9,8 @@ import { Volume2, Sparkles, HelpCircle } from 'lucide-react';
 interface CardItem {
   id: string;
   pairId: string;
+  questionId: string;
+  vocabId: string;
   type: 'word' | 'meaning';
   content: string;
   subContent?: string;
@@ -37,30 +39,44 @@ export const FlipCardBoard: React.FC<FlipCardBoardProps> = ({
   const [events, setEvents] = useState<any[]>([]);
   const [shakingIds, setShakingIds] = useState<string[]>([]);
 
+  // Lỗi 8 Fix: Dùng ref để lưu trữ chính xác các lần lật sai theo từng question_id
+  // và lưu danh sách events mới nhất để không bị mất event cuối do closure cũ trong setTimeout
+  const mismatchesByQuestionRef = useRef<Record<string, number>>({});
+  const allEventsRef = useRef<any[]>([]);
+
   // Initialize cards
   useEffect(() => {
+    mismatchesByQuestionRef.current = {};
+    allEventsRef.current = [];
     const cardList: CardItem[] = [];
+
     questions.forEach((q, idx) => {
-      const v = q.payload;
+      const v = q.payload || {};
       const pairId = `pair_${idx}`;
+      const headword = v.prompt || v.headword || '';
+      const meaning = v.correct_answer || v.meaning || '';
 
       // Card 1: Headword
       cardList.push({
         id: `c_${pairId}_w`,
         pairId,
+        questionId: q.id,
+        vocabId: q.vocab_id,
         type: 'word',
-        content: v.prompt,
+        content: headword,
         posCode: q.pos_code || 'noun',
-        headword: v.prompt,
+        headword,
       });
 
       // Card 2: Meaning
       cardList.push({
         id: `c_${pairId}_m`,
         pairId,
+        questionId: q.id,
+        vocabId: q.vocab_id,
         type: 'meaning',
-        content: v.correct_answer,
-        headword: v.prompt,
+        content: meaning,
+        headword,
       });
     });
 
@@ -86,12 +102,10 @@ export const FlipCardBoard: React.FC<FlipCardBoardProps> = ({
       const card2 = card;
 
       const isMatch = card1.pairId === card2.pairId;
-      const targetVocabId = questions.find(
-        (q) => q.payload.prompt === card1.headword || q.payload.prompt === card2.headword
-      )?.vocab_id;
+      const targetQ = questions.find((q) => q.id === card1.questionId);
 
       if (isMatch) {
-        // Match!
+        // Khớp thẻ thành công!
         sound.playCorrect(matchedPairIds.size);
         sound.speak(card1.headword, 'uk');
         onAnswerFeedback?.(true);
@@ -102,45 +116,74 @@ export const FlipCardBoard: React.FC<FlipCardBoardProps> = ({
         setFlippedIds([]);
         setIsLocked(false);
 
-        setEvents((prev) => [
-          ...prev,
-          {
-            client_event_id: `ev_${Date.now()}_${Math.random()}`,
-            question_id: questions[0]?.id || 'q_1',
-            user_answer: card2.content,
-            attempt_no: 1,
-            response_ms: 1200,
-            hint_used: false,
-          },
-        ]);
+        // Lỗi 8 Fix: Gán đúng question_id của cặp thẻ được ghép
+        const prevMismatches = mismatchesByQuestionRef.current[card1.questionId] || 0;
+        const attemptNo = prevMismatches + 1;
+        const correctAnswer = targetQ?.payload?.correct_answer || (card1.type === 'meaning' ? card1.content : card2.content);
 
-        // Check if finished
+        const matchEvent = {
+          client_event_id: `ev_flip_match_${card1.questionId}_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+          question_id: card1.questionId,
+          user_answer: correctAnswer,
+          attempt_no: attemptNo,
+          response_ms: 1200,
+          hint_used: false,
+        };
+
+        const updatedEvents = [...allEventsRef.current, matchEvent];
+        allEventsRef.current = updatedEvents;
+        setEvents(updatedEvents);
+
+        // Kiểm tra xem đã hoàn tất tất cả các cặp thẻ chưa
         if (newMatched.size === questions.length) {
           setTimeout(() => {
             sound.playWin();
-            const totalAttempts = questions.length + mismatch;
-            const accuracy = Math.round((questions.length / Math.max(1, totalAttempts)) * 100);
-            onComplete(accuracy, mismatch, events);
+
+            // Tính accuracy chuẩn Flip Card: tỷ lệ câu đúng ngay lần đầu (0 mismatch) trên tổng số câu
+            const firstTryCount = questions.filter(
+              (q) => (mismatchesByQuestionRef.current[q.id] || 0) === 0
+            ).length;
+            const accuracy = Math.round((firstTryCount / Math.max(1, questions.length)) * 100);
+            const totalMismatches = Object.values(mismatchesByQuestionRef.current).reduce((a, b) => a + b, 0);
+
+            // Lỗi 8 Fix: Truyền updatedEvents mới nhất bao gồm cặp cuối thay vì state events cũ
+            onComplete(accuracy, totalMismatches, updatedEvents);
           }, 600);
         }
       } else {
-        // Mismatch
+        // Lật sai cặp thẻ
         sound.playWrong();
         setMismatch((m) => m + 1);
         onAnswerFeedback?.(false);
         setShakingIds([card1.id, card2.id]);
 
-        setEvents((prev) => [
-          ...prev,
-          {
-            client_event_id: `ev_${Date.now()}_${Math.random()}`,
-            question_id: questions[0]?.id || 'q_1',
-            user_answer: 'mismatch',
-            attempt_no: 1,
-            response_ms: 2000,
-            hint_used: false,
-          },
-        ]);
+        // Ghi nhận lần lật sai cho từng câu của cả hai thẻ
+        mismatchesByQuestionRef.current[card1.questionId] =
+          (mismatchesByQuestionRef.current[card1.questionId] || 0) + 1;
+        mismatchesByQuestionRef.current[card2.questionId] =
+          (mismatchesByQuestionRef.current[card2.questionId] || 0) + 1;
+
+        const misEvent1 = {
+          client_event_id: `ev_flip_mis_${card1.questionId}_${Date.now()}_1`,
+          question_id: card1.questionId,
+          user_answer: 'mismatch',
+          attempt_no: mismatchesByQuestionRef.current[card1.questionId],
+          response_ms: 1200,
+          hint_used: false,
+        };
+
+        const misEvent2 = {
+          client_event_id: `ev_flip_mis_${card2.questionId}_${Date.now()}_2`,
+          question_id: card2.questionId,
+          user_answer: 'mismatch',
+          attempt_no: mismatchesByQuestionRef.current[card2.questionId],
+          response_ms: 1200,
+          hint_used: false,
+        };
+
+        const updatedEvents = [...allEventsRef.current, misEvent1, misEvent2];
+        allEventsRef.current = updatedEvents;
+        setEvents(updatedEvents);
 
         setTimeout(() => {
           setFlippedIds([]);
@@ -152,7 +195,7 @@ export const FlipCardBoard: React.FC<FlipCardBoardProps> = ({
   };
 
   const handleHint = () => {
-    // Find first unmatched pair and briefly highlight
+    // Tìm cặp thẻ chưa ghép đầu tiên và nhấp nháy gợi ý
     const unmatched = cards.find((c) => !matchedPairIds.has(c.pairId));
     if (!unmatched) return;
     const pair = cards.filter((c) => c.pairId === unmatched.pairId);
