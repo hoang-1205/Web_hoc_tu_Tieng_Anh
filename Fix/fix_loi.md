@@ -39,4 +39,19 @@
 
 ## Lần sửa [2]
 
-_Chưa có lỗi bổ sung được ghi nhận._
+### Lỗi 8 — Flip Card ghi nhận event sai câu nên không thể qua L1 Adventure
+**Mô tả lỗi:** Trong `FlipCardBoard`, mọi cặp ghép và mọi lần lật sai đều gửi `question_id` của `questions[0]`. Server vì vậy chỉ chấm câu đầu tiên; chín câu còn lại không có event. Với Adventure, accuracy tối đa chỉ có thể đạt 10%, thấp hơn ngưỡng 60% của Flip Card nên người chơi không thể qua L1. Ở cặp cuối, `onComplete` còn dùng state `events` cũ trong callback `setTimeout`, có thể làm mất event ghép cuối.
+
+**Cách sửa:** Gắn mỗi cặp thẻ với đúng `question_id`/`vocab_id`, lưu kết quả ghép/sai theo đúng câu và tính accuracy theo quy tắc Flip Card. Khi hoàn tất, truyền danh sách event mới nhất đã bao gồm cặp cuối thay vì state cũ.
+
+### Lỗi 9 — Learning có thể hoàn tất dù còn câu chưa trả lời
+**Mô tả lỗi:** `completeSession` coi phiên Learning là thắng nếu tổng số event đạt số câu (`mergedEvents.length >= session.questions.length`). Điều kiện này đếm event, không đếm `question_id` duy nhất; gửi nhiều event cho cùng một câu có thể vượt ngưỡng trong khi các câu khác chưa được trả lời. Vòng xử lý kết quả cũng chỉ chọn event đầu tiên cho mỗi câu.
+
+**Cách sửa:** Chỉ cho hoàn tất khi có kết quả hợp lệ cho đủ từng `question_id` trong session. Khử trùng lặp theo câu/lần thử và từ chối hoặc bỏ qua event ngoài danh sách câu; không dùng số lượng event thô làm điều kiện hoàn tất.
+
+### Lỗi 10 — Kết quả thử lại của một câu bị bỏ qua khi server chấm
+**Mô tả lỗi:** `completeSession` dùng `mergedEvents.find(...)` để lấy event đầu tiên có `question_id` tương ứng. Nếu cùng câu có nhiều lần thử (được phân biệt bằng `client_event_id` và `attempt_no`), các lần sau không được tính. Một câu trả lời đúng sau lần sai có thể bị chấm sai và SRS bị ghi `q = 1`, dù đặc tả quy định câu đúng từ lần thử thứ hai trở đi nhận `q = 3`.
+
+**Cách sửa:** Gom tất cả event theo `question_id`, sắp xếp/đánh giá theo `attempt_no`; xác định kết quả cuối của câu và chất lượng SRS theo quy tắc thử lại (đúng sau lần đầu: `q = 3`). Tính accuracy theo lần thử đầu và chỉ cập nhật SRS một lần mỗi từ với `q` thấp nhất trong phiên.
+
+
